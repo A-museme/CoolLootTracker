@@ -1,0 +1,10 @@
+
+## Interface: 11504
+## Title: Cool Loot Tracker
+## Notes: Lightweight loot tracking with gold/hour calculation and Auctionator integration
+## Author: Your Name
+## Version: 1.0
+## SavedVariables: CoolLootTrackerDB
+## OptionalDeps: Auctionator
+
+CoolLootTracker.lua
