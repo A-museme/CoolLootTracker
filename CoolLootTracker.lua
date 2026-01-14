@@ -1,32 +1,180 @@
--- Cool Loot Tracker - Main Addon File
--- A lightweight, full-featured loot tracking addon for WoW Classic Anniversary Edition
--- Fixed for Classic API compatibility
+-- Cool Loot Tracker - TBC Classic Anniversary Edition
+-- Refactored with dynamic pricing system
 
 local ADDON_NAME = "CoolLootTracker"
 local CLT = CreateFrame("Frame")
 CLT:RegisterEvent("ADDON_LOADED")
 CLT:RegisterEvent("CHAT_MSG_LOOT")
 CLT:RegisterEvent("CHAT_MSG_MONEY")
+CLT:RegisterEvent("QUEST_TURNED_IN")
 CLT:RegisterEvent("PLAYER_LOGOUT")
+CLT:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+CLT:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
+CLT:RegisterEvent("PLAYER_ENTERING_WORLD")
 
 -- Database
 CoolLootTrackerDB = CoolLootTrackerDB or {
     lootLog = {},
     sessionStart = time(),
-    totalValue = 0,
     minimapButton = {
         hide = false,
         position = 45
     },
-    windowPosition = {}
+    windowPosition = {},
+    emaGPH = 0,  -- Exponential Moving Average for GPH
+    oldMoney = 0,  -- Track money for interaction pausing
+    filterGreyItems = false,  -- Filter out poor quality items
+    -- Per-quality price sources: 'vendor', 'auction', or 'best' (prefer auction, fallback to vendor)
+    priceByQuality = {
+        [0] = "vendor",  -- Poor: vendor
+        [1] = "best",    -- Common: best available
+        [2] = "best",    -- Uncommon: best available
+        [3] = "best",    -- Rare: best available
+        [4] = "best",    -- Epic: best available
+        [5] = "best"     -- Legendary: best available
+    },
+    -- Separate tracking for different money sources
+    moneyCash = 0,   -- Raw money from loot
+    moneyQuests = 0  -- Money from quest rewards
 }
 
 local db = CoolLootTrackerDB
 
--- Helper Functions
+-- Interaction pausing state
+local interactionPaused = false
+
+-- Helper function to create frames with backdrop support for TBC
+local function CreateFrameWithBackdrop(frameType, name, parent, template)
+    local frame = CreateFrame(frameType, name, parent, template)
+    if not frame.SetBackdrop then
+        Mixin(frame, BackdropTemplateMixin)
+    end
+    return frame
+end
+
+-- Pricing System with improved caching
+local PriceCache = {}
+local ItemInfoCache = {}
+local CACHE_TTL = 60 * 60  -- 60 minutes for price cache
+local ITEM_INFO_CACHE_TTL = 300  -- 5 minutes for item info cache
+
+local function GetCachedItemInfo(itemLink)
+    local cached = ItemInfoCache[itemLink]
+    if cached and (time() - cached.timestamp) < ITEM_INFO_CACHE_TTL then
+        return cached.name, cached.texture, cached.sellPrice
+    end
+    return nil
+end
+
+local function SetCachedItemInfo(itemLink, name, texture, sellPrice)
+    ItemInfoCache[itemLink] = {
+        name = name,
+        texture = texture,
+        sellPrice = sellPrice,
+        timestamp = time()
+    }
+end
+
+local function GetPrices(itemLink)
+    if not itemLink then return 0, 0 end
+    
+    -- Check price cache first (valid for 60 minutes)
+    local cached = PriceCache[itemLink]
+    if cached and (time() - cached.timestamp) < CACHE_TTL then
+        return cached.vendor, cached.auction
+    end
+    
+    local vendorPrice = 0
+    local auctionPrice = 0
+    
+    -- Get vendor price from game (use cache if available)
+    local cachedName, cachedTexture, cachedSellPrice = GetCachedItemInfo(itemLink)
+    local sellPrice = cachedSellPrice
+    
+    if not sellPrice then
+        local _, _, _, _, _, _, _, _, _, _, sellPriceRaw = GetItemInfo(itemLink)
+        sellPrice = sellPriceRaw
+        if cachedName and cachedTexture then
+            SetCachedItemInfo(itemLink, cachedName, cachedTexture, sellPrice)
+        end
+    end
+    
+    if sellPrice and sellPrice > 0 then
+        vendorPrice = sellPrice
+    end
+    
+    -- Try Auctionator
+    if Auctionator and Auctionator.API and Auctionator.API.v1 then
+        local success, price = pcall(Auctionator.API.v1.GetAuctionPriceByItemLink, "CoolLootTracker", itemLink)
+        if success and price and type(price) == "number" and price > 0 then
+            auctionPrice = price
+        end
+    end
+    
+    -- Try Auctioneer if no Auctionator data
+    if auctionPrice == 0 and AucAdvanced and AucAdvanced.API then
+        local success, price = pcall(AucAdvanced.API.GetMarketValue, itemLink)
+        if success and price and type(price) == "number" and price > 0 then
+            auctionPrice = price
+        end
+    end
+    
+    -- Cache the results
+    PriceCache[itemLink] = {
+        vendor = vendorPrice,
+        auction = auctionPrice,
+        timestamp = time()
+    }
+    
+    return vendorPrice, auctionPrice
+end
+
+local function GetBestPrice(itemLink)
+    local vendor, auction = GetPrices(itemLink)
+    
+    -- Get item quality to determine price source
+    local _, _, quality = GetItemInfo(itemLink)
+    quality = quality or 0
+    
+    -- Get price source preference for this quality
+    local priceSource = db.priceByQuality[quality] or "best"
+    
+    -- Apply price source logic
+    if priceSource == "vendor" then
+        return vendor
+    elseif priceSource == "auction" then
+        return auction > 0 and auction or vendor
+    else -- "best" - prefer auction, fallback to vendor
+        if auction > 0 then
+            return auction
+        elseif vendor > 0 then
+            return vendor
+        else
+            return 0
+        end
+    end
+end
+
+local function CalculateTotalValue()
+    local total = 0
+    -- Add item values
+    for i = 1, #db.lootLog do
+        local loot = db.lootLog[i]
+        if loot.link then
+            local price = GetBestPrice(loot.link)
+            total = total + (price * loot.quantity)
+        elseif loot.value then
+            total = total + loot.value
+        end
+    end
+    -- Add tracked money sources
+    total = total + (db.moneyCash or 0) + (db.moneyQuests or 0)
+    return total
+end
+
 local function FormatMoney(copper)
     if not copper or copper < 0 then return "0c" end
-    copper = math.floor(copper)  -- Remove decimals
+    copper = math.floor(copper)
     local gold = math.floor(copper / 10000)
     local silver = math.floor((copper % 10000) / 100)
     local c = copper % 100
@@ -38,37 +186,37 @@ local function FormatMoney(copper)
     return str
 end
 
-local function GetItemValue(itemLink)
-    local vendorPrice = 0
-    local auctionPrice = 0
-    
-    -- Get vendor price
-    if itemLink then
-        local _, _, _, _, _, _, _, _, _, _, sellPrice = GetItemInfo(itemLink)
-        if sellPrice then
-            vendorPrice = sellPrice
-        end
-    end
-    
-    -- Try to get Auctionator price if available
-    if Auctionator and Auctionator.API and Auctionator.API.v1 and Auctionator.API.v1.GetAuctionPriceByItemLink then
-        local success, price = pcall(Auctionator.API.v1.GetAuctionPriceByItemLink, Auctionator, itemLink)
-        if success and price and type(price) == "number" then
-            auctionPrice = price
-        end
-    end
-    
-    return math.max(vendorPrice, auctionPrice), vendorPrice, auctionPrice
-end
-
 local function GetSessionDuration()
     return time() - db.sessionStart
 end
 
+-- EMA (Exponential Moving Average) for GPH calculation
 local function GetGoldPerHour()
     local duration = GetSessionDuration()
-    if duration < 60 then return 0 end
-    return (db.totalValue / duration) * 3600
+    if duration < 1 then return 0 end
+    
+    local total = CalculateTotalValue()
+    
+    -- Calculate current rate
+    local currentRate = 0
+    if total > 0 and duration > 0 then
+        currentRate = (total / duration) * 3600
+    end
+    
+    -- EMA parameters
+    local baseAlpha = 0.1
+    local warmupSeconds = 30
+    local alpha = baseAlpha * math.min(1, duration / warmupSeconds)
+    
+    -- Initialize EMA if not set
+    if not db.emaGPH then
+        db.emaGPH = 0
+    end
+    
+    -- Calculate EMA: new_value = alpha * current + (1 - alpha) * previous
+    db.emaGPH = alpha * currentRate + (1 - alpha) * db.emaGPH
+    
+    return math.floor(db.emaGPH)
 end
 
 -- Minimap Button
@@ -112,7 +260,7 @@ minimapButton:SetScript("OnEnter", function(self)
     GameTooltip:AddLine("Left-click: Toggle window", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("Right-click: Reset session", 0.8, 0.8, 0.8)
     GameTooltip:AddLine(" ")
-    GameTooltip:AddLine("Session Value: " .. FormatMoney(db.totalValue), 1, 1, 1)
+    GameTooltip:AddLine("Total Value: " .. FormatMoney(CalculateTotalValue()), 1, 1, 1)
     GameTooltip:AddLine("Gold/Hour: " .. FormatMoney(GetGoldPerHour()), 1, 1, 1)
     GameTooltip:Show()
 end)
@@ -139,8 +287,8 @@ minimapButton:SetScript("OnDragStop", function(self)
 end)
 
 -- Main Window
-local mainFrame = CreateFrame("Frame", "CoolLootTrackerFrame", UIParent, "BackdropTemplate")
-mainFrame:SetWidth(400)
+local mainFrame = CreateFrameWithBackdrop("Frame", "CoolLootTrackerFrame", UIParent)
+mainFrame:SetWidth(450)
 mainFrame:SetHeight(500)
 mainFrame:SetPoint("CENTER")
 mainFrame:SetBackdrop({
@@ -172,10 +320,10 @@ local closeButton = CreateFrame("Button", nil, mainFrame, "UIPanelCloseButton")
 closeButton:SetPoint("TOPRIGHT", -5, -5)
 
 -- Stats Panel
-local statsFrame = CreateFrame("Frame", nil, mainFrame, "BackdropTemplate")
+local statsFrame = CreateFrameWithBackdrop("Frame", nil, mainFrame)
 statsFrame:SetPoint("TOPLEFT", 20, -50)
 statsFrame:SetPoint("TOPRIGHT", -20, -50)
-statsFrame:SetHeight(100)
+statsFrame:SetHeight(150)
 statsFrame:SetBackdrop({
     bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -197,6 +345,77 @@ sessionTime:SetPoint("TOPLEFT", sessionGPH, "BOTTOMLEFT", 0, -5)
 
 local itemCount = statsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 itemCount:SetPoint("TOPLEFT", sessionTime, "BOTTOMLEFT", 0, -5)
+
+-- Filter Checkboxes
+local filterGreyCheckbox = CreateFrame("CheckButton", nil, statsFrame, "UICheckButtonTemplate")
+filterGreyCheckbox:SetPoint("TOPLEFT", itemCount, "BOTTOMLEFT", 0, -8)
+filterGreyCheckbox:SetSize(20, 20)
+filterGreyCheckbox:SetChecked(db.filterGreyItems or false)
+filterGreyCheckbox:SetScript("OnClick", function(self)
+    db.filterGreyItems = self:GetChecked()
+    -- Refresh display to show current state
+    CLT:UpdateDisplay()
+end)
+filterGreyCheckbox:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Filter Grey Items", 1, 1, 1)
+    GameTooltip:AddLine("When enabled, poor quality (grey) items will not be tracked.", 0.8, 0.8, 0.8, true)
+    GameTooltip:Show()
+end)
+filterGreyCheckbox:SetScript("OnLeave", function(self)
+    GameTooltip:Hide()
+end)
+
+local filterGreyLabel = statsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+filterGreyLabel:SetPoint("LEFT", filterGreyCheckbox, "RIGHT", 5, 0)
+filterGreyLabel:SetText("Filter Grey Items")
+
+-- Per-quality price source dropdown (simplified - just for grey items)
+local priceSourceLabel = statsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+priceSourceLabel:SetPoint("TOPLEFT", filterGreyCheckbox, "BOTTOMLEFT", 0, -8)
+priceSourceLabel:SetText("Grey Items Price:")
+
+local priceSourceDropdown = CreateFrame("Frame", nil, statsFrame, "UIDropDownMenuTemplate")
+priceSourceDropdown:SetPoint("LEFT", priceSourceLabel, "RIGHT", 10, 0)
+UIDropDownMenu_SetWidth(priceSourceDropdown, 100)
+UIDropDownMenu_SetText(priceSourceDropdown, db.priceByQuality[0] == "vendor" and "Vendor" or (db.priceByQuality[0] == "auction" and "Auction" or "Best"))
+
+local function PriceSourceMenu_Initialize(self, level)
+    local info = UIDropDownMenu_CreateInfo()
+    local current = db.priceByQuality[0] or "best"
+    
+    info.text = "Best"
+    info.func = function()
+        db.priceByQuality[0] = "best"
+        UIDropDownMenu_SetText(priceSourceDropdown, "Best")
+        PriceCache = {}
+        CLT:UpdateDisplay()
+    end
+    info.checked = (current == "best")
+    UIDropDownMenu_AddButton(info)
+    
+    info.text = "Vendor"
+    info.func = function()
+        db.priceByQuality[0] = "vendor"
+        UIDropDownMenu_SetText(priceSourceDropdown, "Vendor")
+        PriceCache = {}
+        CLT:UpdateDisplay()
+    end
+    info.checked = (current == "vendor")
+    UIDropDownMenu_AddButton(info)
+    
+    info.text = "Auction"
+    info.func = function()
+        db.priceByQuality[0] = "auction"
+        UIDropDownMenu_SetText(priceSourceDropdown, "Auction")
+        PriceCache = {}
+        CLT:UpdateDisplay()
+    end
+    info.checked = (current == "auction")
+    UIDropDownMenu_AddButton(info)
+end
+
+UIDropDownMenu_Initialize(priceSourceDropdown, PriceSourceMenu_Initialize)
 
 -- Loot Log ScrollFrame
 local scrollFrame = CreateFrame("ScrollFrame", "CoolLootTrackerScrollFrame", mainFrame, "UIPanelScrollFrameTemplate")
@@ -223,18 +442,20 @@ clearButton:SetWidth(100)
 clearButton:SetHeight(25)
 clearButton:SetPoint("LEFT", resetButton, "RIGHT", 10, 0)
 clearButton:SetText("Clear Log")
-clearButton:SetScript("OnClick", function()
-    db.lootLog = {}
-    CLT:UpdateDisplay()
-end)
+        clearButton:SetScript("OnClick", function()
+            db.lootLog = {}
+            PriceCache = {}
+            ItemInfoCache = {}
+            CLT:UpdateDisplay()
+        end)
 
--- Loot frame pool for better performance
+-- Loot frame pool
 local lootFramePool = {}
 
 local function GetLootFrame()
     local frame = table.remove(lootFramePool)
     if not frame then
-        frame = CreateFrame("Frame", nil, scrollChild, "BackdropTemplate")
+        frame = CreateFrameWithBackdrop("Frame", nil, scrollChild)
         frame:SetBackdrop({
             bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
             edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -248,12 +469,14 @@ local function GetLootFrame()
         frame.icon:SetPoint("LEFT", 5, 0)
         
         frame.nameText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        frame.nameText:SetPoint("LEFT", frame.icon, "RIGHT", 5, 5)
+        frame.nameText:SetPoint("LEFT", frame.icon, "RIGHT", 5, 8)
+        frame.nameText:SetPoint("RIGHT", -5, 8)
         frame.nameText:SetJustifyH("LEFT")
         
-        frame.valueText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        frame.valueText:SetPoint("TOPLEFT", frame.nameText, "BOTTOMLEFT", 0, -2)
-        frame.valueText:SetTextColor(1, 0.82, 0)
+        frame.priceText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        frame.priceText:SetPoint("TOPLEFT", frame.nameText, "BOTTOMLEFT", 0, -2)
+        frame.priceText:SetPoint("RIGHT", -5, 0)
+        frame.priceText:SetJustifyH("LEFT")
     end
     frame:Show()
     return frame
@@ -270,63 +493,123 @@ end
 -- Update Display Function
 function CLT:UpdateDisplay()
     -- Update stats
-    sessionValue:SetText("Total Value: " .. FormatMoney(db.totalValue))
+    local totalValue = CalculateTotalValue()
+    sessionValue:SetText("Total Value: " .. FormatMoney(totalValue))
     sessionGPH:SetText("Gold/Hour: " .. FormatMoney(GetGoldPerHour()))
     
     local duration = GetSessionDuration()
     local hours = math.floor(duration / 3600)
     local mins = math.floor((duration % 3600) / 60)
     sessionTime:SetText(string.format("Session Time: %dh %dm", hours, mins))
-    itemCount:SetText("Items Looted: " .. #db.lootLog)
+    
+    -- Show money breakdown
+    local moneyBreakdown = "Items: " .. #db.lootLog
+    if (db.moneyCash or 0) > 0 or (db.moneyQuests or 0) > 0 then
+        moneyBreakdown = moneyBreakdown .. " | "
+        if (db.moneyCash or 0) > 0 then
+            moneyBreakdown = moneyBreakdown .. "Loot: " .. FormatMoney(db.moneyCash)
+        end
+        if (db.moneyQuests or 0) > 0 then
+            if (db.moneyCash or 0) > 0 then
+                moneyBreakdown = moneyBreakdown .. " | "
+            end
+            moneyBreakdown = moneyBreakdown .. "Quests: " .. FormatMoney(db.moneyQuests)
+        end
+    end
+    itemCount:SetText(moneyBreakdown)
     
     -- Clear existing loot frames
     for _, child in ipairs({scrollChild:GetChildren()}) do
         ReleaseLootFrame(child)
     end
     
-    -- Consolidate duplicate items
-    local consolidatedLoot = {}
-    local itemKeys = {}
+    -- Consolidate only money entries, keep all items separate
+    local processedLoot = {}
+    local lootGoldTotal = 0
+    local lootGoldCount = 0
+    local questGoldTotal = 0
+    local questGoldCount = 0
+    local lootGoldTimestamp = 0
+    local questGoldTimestamp = 0
     
     for i = 1, #db.lootLog do
         local loot = db.lootLog[i]
-        local key = loot.link or loot.name
         
-        if not consolidatedLoot[key] then
-            consolidatedLoot[key] = {
-                name = loot.name,
-                link = loot.link,
-                quantity = loot.quantity,
-                texture = loot.texture,
-                value = loot.value,
-                vendorValue = loot.vendorValue,
-                auctionValue = loot.auctionValue,
-                timestamp = loot.timestamp,
-                count = 1
-            }
-            table.insert(itemKeys, key)
-        else
-            consolidatedLoot[key].quantity = consolidatedLoot[key].quantity + loot.quantity
-            consolidatedLoot[key].value = consolidatedLoot[key].value + loot.value
-            consolidatedLoot[key].vendorValue = consolidatedLoot[key].vendorValue + loot.vendorValue
-            consolidatedLoot[key].auctionValue = consolidatedLoot[key].auctionValue + loot.auctionValue
-            consolidatedLoot[key].count = consolidatedLoot[key].count + 1
-            -- Keep the most recent timestamp
-            if loot.timestamp > consolidatedLoot[key].timestamp then
-                consolidatedLoot[key].timestamp = loot.timestamp
+        -- Check if this is a money entry (handle both "Gold" and "Quest Gold", and old entries without source)
+        -- Also check if it's a money entry by checking if name is "Gold" or if it has no link but has a value
+        if (loot.name == "Gold" or loot.name == "Quest Gold") or (not loot.link and loot.value and loot.value > 0) then
+            -- Determine source: use explicit source, or infer from name, or default to "loot"
+            local source = loot.source
+            if not source then
+                if loot.name == "Quest Gold" then
+                    source = "quest"
+                else
+                    source = "loot"  -- Default to "loot" for backward compatibility
+                end
             end
+            
+            -- Consolidate money by source
+            if source == "quest" then
+                questGoldTotal = questGoldTotal + (loot.value or 0)
+                questGoldCount = questGoldCount + 1
+                if loot.timestamp and loot.timestamp > questGoldTimestamp then
+                    questGoldTimestamp = loot.timestamp
+                end
+            else
+                -- All other money (including "loot" source and old entries without source)
+                lootGoldTotal = lootGoldTotal + (loot.value or 0)
+                lootGoldCount = lootGoldCount + 1
+                if loot.timestamp and loot.timestamp > lootGoldTimestamp then
+                    lootGoldTimestamp = loot.timestamp
+                end
+            end
+        else
+            -- Keep items separate
+            table.insert(processedLoot, loot)
         end
     end
     
-    -- Create loot frames from consolidated data
+    -- Add consolidated gold entries if there's any (always add, even if 0, to show in log)
+    -- But only add if we actually have money entries
+    if lootGoldCount > 0 and lootGoldTotal > 0 then
+        table.insert(processedLoot, {
+            name = "Gold",
+            link = nil,
+            quantity = 1,
+            texture = "Interface\\Icons\\INV_Misc_Coin_01",
+            value = lootGoldTotal,
+            timestamp = lootGoldTimestamp > 0 and lootGoldTimestamp or time(),
+            count = lootGoldCount,
+            source = "loot"
+        })
+    end
+    
+    if questGoldCount > 0 and questGoldTotal > 0 then
+        table.insert(processedLoot, {
+            name = "Quest Gold",
+            link = nil,
+            quantity = 1,
+            texture = "Interface\\Icons\\INV_Misc_Coin_01",
+            value = questGoldTotal,
+            timestamp = questGoldTimestamp > 0 and questGoldTimestamp or time(),
+            count = questGoldCount,
+            source = "quest"
+        })
+    end
+    
+    -- Sort by timestamp (newest first) to show proper chronological order
+    table.sort(processedLoot, function(a, b)
+        return (a.timestamp or 0) > (b.timestamp or 0)
+    end)
+    
+    -- Create loot frames (newest first, show all entries)
     local yOffset = -5
-    for i = #itemKeys, math.max(1, #itemKeys - 100), -1 do
-        local key = itemKeys[i]
-        local loot = consolidatedLoot[key]
+    for i = 1, #processedLoot do
+        local loot = processedLoot[i]
         
         local lootFrame = GetLootFrame()
         lootFrame:SetWidth(scrollChild:GetWidth() - 10)
-        lootFrame:SetHeight(40)
+        lootFrame:SetHeight(45)
         lootFrame:SetPoint("TOPLEFT", 5, yOffset)
         lootFrame:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
         lootFrame:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
@@ -338,8 +621,7 @@ function CLT:UpdateDisplay()
             lootFrame.icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
         end
         
-        -- Item name with count
-        lootFrame.nameText:SetPoint("RIGHT", -5, 5)
+        -- Item name with quantity (only show quantity if > 1)
         local displayText = ""
         if loot.link then
             displayText = loot.link
@@ -347,59 +629,115 @@ function CLT:UpdateDisplay()
             displayText = loot.name
         end
         
-        -- Show total quantity and number of times looted
-        if loot.count > 1 then
-            displayText = displayText .. " |cffaaaaaa(x" .. loot.count .. ")|r"
-        end
-        if loot.quantity > 1 or loot.count > 1 then
-            displayText = displayText .. " |cffffff00[" .. loot.quantity .. " total]|r"
+        -- Only show quantity for items if > 1, and show count for consolidated gold
+        if (loot.name == "Gold" or loot.name == "Quest Gold") and loot.count and loot.count > 1 then
+            displayText = displayText .. " |cffaaaaaa(consolidated from " .. loot.count .. " " .. (loot.source == "quest" and "quests" or "drops") .. ")|r"
+        elseif loot.link and loot.quantity > 1 then
+            displayText = displayText .. " |cffffff00x" .. loot.quantity .. "|r"
         end
         
         lootFrame.nameText:SetText(displayText)
         
-        -- Value
-        local valueStr = ""
+        -- Price display
+        local priceText = ""
         
-        -- Show vendor value
-        if loot.vendorValue > 0 then
-            valueStr = "|cffffffffV:|r " .. FormatMoney(loot.vendorValue)
-        end
-        
-        -- Show auction value
-        if loot.auctionValue > 0 then
-            if valueStr ~= "" then
-                valueStr = valueStr .. " |cffffffffAH:|r " .. FormatMoney(loot.auctionValue)
+        if loot.name == "Gold" or loot.name == "Quest Gold" then
+            priceText = "|cffffd700" .. FormatMoney(loot.value) .. "|r"
+        elseif loot.link then
+            local vendorPrice, auctionPrice = GetPrices(loot.link)
+            local totalVendor = vendorPrice * loot.quantity
+            local totalAuction = auctionPrice * loot.quantity
+            
+            -- Get item quality to determine which price is being used
+            local _, _, quality = GetItemInfo(loot.link)
+            quality = quality or 0
+            local priceSource = db.priceByQuality[quality] or "best"
+            local bestPrice = GetBestPrice(loot.link)
+            local totalBest = bestPrice * loot.quantity
+            
+            -- Show the price being used based on quality settings
+            if priceSource == "vendor" then
+                -- Vendor price is primary
+                if vendorPrice > 0 then
+                    priceText = "|cffaaaaaaVendor: " .. FormatMoney(totalVendor) .. "|r"
+                    if auctionPrice > 0 then
+                        priceText = priceText .. "  |cff888888(AH: " .. FormatMoney(totalAuction) .. ")|r"
+                    end
+                else
+                    priceText = "|cffff0000No vendor price|r"
+                end
+            elseif priceSource == "auction" then
+                -- Auction price is primary
+                if auctionPrice > 0 then
+                    priceText = "|cff00ff00AH: " .. FormatMoney(totalAuction) .. "|r"
+                    if vendorPrice > 0 then
+                        priceText = priceText .. "  |cffaaaaaa(Vendor: " .. FormatMoney(totalVendor) .. ")|r"
+                    end
+                elseif vendorPrice > 0 then
+                    priceText = "|cffaaaaaaVendor: " .. FormatMoney(totalVendor) .. "|r (AH unavailable)"
+                else
+                    priceText = "|cffff0000No price data|r"
+                end
             else
-                valueStr = "|cffffffffAH:|r " .. FormatMoney(loot.auctionValue)
+                -- Best available (prefer auction, fallback to vendor)
+                if auctionPrice > 0 then
+                    priceText = "|cff00ff00AH: " .. FormatMoney(totalAuction) .. "|r"
+                    if vendorPrice > 0 then
+                        priceText = priceText .. "  |cffaaaaaa(Vendor: " .. FormatMoney(totalVendor) .. ")|r"
+                    end
+                elseif vendorPrice > 0 then
+                    priceText = "|cffaaaaaaVendor: " .. FormatMoney(totalVendor) .. "|r"
+                else
+                    priceText = "|cffff0000No price data|r"
+                end
             end
         end
         
-        -- If no prices available
-        if valueStr == "" then
-            valueStr = "|cffff0000No price data|r"
-        end
+        lootFrame.priceText:SetText(priceText)
         
-        lootFrame.valueText:SetText(valueStr)
-        
+        -- Tooltip
         lootFrame:SetScript("OnEnter", function(self)
             if loot.link then
                 GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
                 GameTooltip:SetHyperlink(loot.link)
                 GameTooltip:AddLine(" ")
-                GameTooltip:AddLine("Total Quantity: " .. loot.quantity, 1, 1, 1)
-                GameTooltip:AddLine("Times Looted: " .. loot.count, 1, 1, 1)
-                GameTooltip:AddLine(" ")
-                GameTooltip:AddLine("Vendor (Total): " .. FormatMoney(loot.vendorValue), 1, 1, 1)
-                if loot.auctionValue > 0 then
-                    GameTooltip:AddLine("Auction (Total): " .. FormatMoney(loot.auctionValue), 1, 1, 1)
+                GameTooltip:AddLine("Quantity: " .. loot.quantity, 1, 1, 1)
+                
+                local vendorPrice, auctionPrice = GetPrices(loot.link)
+                if auctionPrice > 0 or vendorPrice > 0 then
+                    GameTooltip:AddLine(" ")
+                    if db.forceVendorPrice then
+                        -- Show vendor price as primary when forced
+                        if vendorPrice > 0 then
+                            GameTooltip:AddLine("Vendor (Each): " .. FormatMoney(vendorPrice), 0.7, 0.7, 0.7)
+                            GameTooltip:AddLine("Vendor Total: " .. FormatMoney(vendorPrice * loot.quantity), 0.7, 0.7, 0.7)
+                        end
+                        if auctionPrice > 0 then
+                            GameTooltip:AddLine("AH Price (Each): " .. FormatMoney(auctionPrice), 0.5, 0.5, 0.5)
+                            GameTooltip:AddLine("AH Total: " .. FormatMoney(auctionPrice * loot.quantity), 0.5, 0.5, 0.5)
+                        end
+                    else
+                        -- Show auction price as primary when not forced
+                        if auctionPrice > 0 then
+                            GameTooltip:AddLine("AH Price (Each): " .. FormatMoney(auctionPrice), 0, 1, 0)
+                            GameTooltip:AddLine("AH Total: " .. FormatMoney(auctionPrice * loot.quantity), 0, 1, 0)
+                        end
+                        if vendorPrice > 0 then
+                            GameTooltip:AddLine("Vendor (Each): " .. FormatMoney(vendorPrice), 0.7, 0.7, 0.7)
+                            GameTooltip:AddLine("Vendor Total: " .. FormatMoney(vendorPrice * loot.quantity), 0.7, 0.7, 0.7)
+                        end
+                    end
                 end
+                
                 GameTooltip:Show()
-            elseif loot.name == "Gold" then
+            elseif loot.name == "Gold" or loot.name == "Quest Gold" then
                 GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                GameTooltip:SetText("Gold Looted", 1, 0.82, 0)
+                GameTooltip:SetText(loot.name, 1, 0.82, 0)
                 GameTooltip:AddLine(" ")
                 GameTooltip:AddLine("Total Amount: " .. FormatMoney(loot.value), 1, 1, 1)
-                GameTooltip:AddLine("Times Looted: " .. loot.count, 1, 1, 1)
+                if loot.count and loot.count > 1 then
+                    GameTooltip:AddLine("Consolidated from " .. loot.count .. " " .. (loot.source == "quest" and "quests" or "drops"), 0.8, 0.8, 0.8)
+                end
                 GameTooltip:Show()
             end
         end)
@@ -408,7 +746,7 @@ function CLT:UpdateDisplay()
             GameTooltip:Hide()
         end)
         
-        yOffset = yOffset - 45
+        yOffset = yOffset - 50
     end
     
     scrollChild:SetHeight(math.abs(yOffset) + 5)
@@ -418,6 +756,11 @@ function CLT:ToggleMainWindow()
     if mainFrame:IsShown() then
         mainFrame:Hide()
     else
+        -- Update checkboxes to match database
+        filterGreyCheckbox:SetChecked(db.filterGreyItems or false)
+        -- Update dropdown
+        local greyPriceSource = db.priceByQuality[0] or "best"
+        UIDropDownMenu_SetText(priceSourceDropdown, greyPriceSource == "vendor" and "Vendor" or (greyPriceSource == "auction" and "Auction" or "Best"))
         self:UpdateDisplay()
         mainFrame:Show()
     end
@@ -430,7 +773,11 @@ function CLT:ResetSession()
         button2 = "Cancel",
         OnAccept = function()
             db.sessionStart = time()
-            db.totalValue = 0
+            db.emaGPH = 0
+            db.moneyCash = 0
+            db.moneyQuests = 0
+            PriceCache = {}
+            ItemInfoCache = {}
             CLT:UpdateDisplay()
             print("|cff00ff00Cool Loot Tracker:|r Session reset!")
         end,
@@ -442,17 +789,21 @@ function CLT:ResetSession()
     StaticPopup_Show("CLT_RESET_CONFIRM")
 end
 
--- Classic-compatible delayed callback function
+-- TBC-compatible delayed callback
 local function DelayedCallback(delay, callback)
-    local frame = CreateFrame("Frame")
-    local timeElapsed = 0
-    frame:SetScript("OnUpdate", function(self, elapsed)
-        timeElapsed = timeElapsed + elapsed
-        if timeElapsed >= delay then
-            self:SetScript("OnUpdate", nil)
-            callback()
-        end
-    end)
+    if C_Timer and C_Timer.After then
+        C_Timer.After(delay, callback)
+    else
+        local frame = CreateFrame("Frame")
+        local timeElapsed = 0
+        frame:SetScript("OnUpdate", function(self, elapsed)
+            timeElapsed = timeElapsed + elapsed
+            if timeElapsed >= delay then
+                self:SetScript("OnUpdate", nil)
+                callback()
+            end
+        end)
+    end
 end
 
 -- Event Handlers
@@ -473,73 +824,197 @@ CLT:SetScript("OnEvent", function(self, event, ...)
                 minimapButton:Hide()
             end
             
-            print("|cff00ff00Cool Loot Tracker|r loaded! Click the minimap button to open.")
+            -- Initialize money tracking
+            if not db.oldMoney or db.oldMoney == 0 then
+                db.oldMoney = GetMoney()
+            end
+            
+            -- Initialize price by quality if not set
+            if not db.priceByQuality then
+                db.priceByQuality = {
+                    [0] = "vendor",  -- Poor: vendor
+                    [1] = "best",    -- Common: best available
+                    [2] = "best",    -- Uncommon: best available
+                    [3] = "best",    -- Rare: best available
+                    [4] = "best",    -- Epic: best available
+                    [5] = "best"     -- Legendary: best available
+                }
+            end
+            
+            -- Initialize money counters if not set
+            if not db.moneyCash then db.moneyCash = 0 end
+            if not db.moneyQuests then db.moneyQuests = 0 end
+            
+            -- Register for Auctionator database updates (if already loaded)
+            if Auctionator and Auctionator.API and Auctionator.API.v1 and Auctionator.API.v1.RegisterForDBUpdate then
+                Auctionator.API.v1.RegisterForDBUpdate("CoolLootTracker", function()
+                    -- Clear price cache when database updates
+                    PriceCache = {}
+                    -- Refresh display if window is open
+                    if mainFrame:IsShown() then
+                        CLT:UpdateDisplay()
+                    end
+                end)
+            end
+            
+            print("|cff00ff00Cool Loot Tracker|r loaded! Type /clt for commands.")
+        elseif addonName == "Auctionator" then
+            -- Auctionator just loaded, register for database updates
+            if Auctionator and Auctionator.API and Auctionator.API.v1 and Auctionator.API.v1.RegisterForDBUpdate then
+                Auctionator.API.v1.RegisterForDBUpdate("CoolLootTracker", function()
+                    -- Clear price cache when database updates
+                    PriceCache = {}
+                    -- Refresh display if window is open
+                    if mainFrame:IsShown() then
+                        CLT:UpdateDisplay()
+                    end
+                end)
+            end
+        end
+        
+    elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" then
+        local interaction = ...
+        -- Pause tracking during relevant interactions (TBC compatible)
+        if Enum and Enum.PlayerInteractionType then
+            if interaction == Enum.PlayerInteractionType.Merchant or
+               interaction == Enum.PlayerInteractionType.Banker or
+               interaction == Enum.PlayerInteractionType.GuildBanker or
+               interaction == Enum.PlayerInteractionType.MailInfo or
+               interaction == Enum.PlayerInteractionType.Auctioneer or
+               interaction == Enum.PlayerInteractionType.BlackMarketAuctioneer then
+                interactionPaused = true
+                -- Store current money to detect changes when interaction closes
+                db.oldMoney = GetMoney()
+            end
+        else
+            -- TBC fallback: pause on any interaction
+            interactionPaused = true
+            db.oldMoney = GetMoney()
+        end
+        
+    elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
+        -- Resume tracking and check for money changes
+        if interactionPaused then
+            interactionPaused = false
+            -- Update old money for next interaction
+            db.oldMoney = GetMoney()
+        end
+        
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        -- Initialize money tracking
+        if not db.oldMoney or db.oldMoney == 0 then
+            db.oldMoney = GetMoney()
         end
         
     elseif event == "CHAT_MSG_LOOT" then
+        -- Skip tracking if interaction is paused
+        if interactionPaused then return end
+        
         local msg = ...
         
-        -- Only track YOUR loot - must contain "You receive loot:" or "You create"
-        if not (msg:find("You receive loot:") or msg:find("You create")) then
-            return
+        -- Check for crafted items first and skip them
+        if LOOT_ITEM_CREATED_SELF_MULTIPLE and msg:match(LOOT_ITEM_CREATED_SELF_MULTIPLE:gsub("%%s", ".+"):gsub("%%d", "%%d+")) then
+            return  -- Skip crafted items
+        end
+        if LOOT_ITEM_CREATED_SELF and msg:match(LOOT_ITEM_CREATED_SELF:gsub("%%s", ".+")) then
+            return  -- Skip crafted items
         end
         
-        -- Parse loot message
-        local itemLink = msg:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+        -- Use game constants for better pattern matching (TBC compatible)
+        local itemLink, quantity
+        local matched = false
+        
+        -- Try matching against game constants
+        if LOOT_ITEM_SELF_MULTIPLE then
+            local pattern = LOOT_ITEM_SELF_MULTIPLE:gsub("%%s", "(.+)"):gsub("%%d", "(%%d+)")
+            itemLink, quantity = msg:match(pattern)
+            if itemLink then matched = true end
+        end
+        
+        if not matched and LOOT_ITEM_PUSHED_SELF_MULTIPLE then
+            local pattern = LOOT_ITEM_PUSHED_SELF_MULTIPLE:gsub("%%s", "(.+)"):gsub("%%d", "(%%d+)")
+            itemLink, quantity = msg:match(pattern)
+            if itemLink then matched = true end
+        end
+        
+        if not matched and LOOT_ITEM_SELF then
+            local pattern = LOOT_ITEM_SELF:gsub("%%s", "(.+)")
+            itemLink = msg:match(pattern)
+            if itemLink then
+                matched = true
+                quantity = 1
+            end
+        end
+        
+        if not matched and LOOT_ITEM_PUSHED_SELF then
+            local pattern = LOOT_ITEM_PUSHED_SELF:gsub("%%s", "(.+)")
+            itemLink = msg:match(pattern)
+            if itemLink then
+                matched = true
+                quantity = 1
+            end
+        end
+        
+        -- Fallback to old pattern matching if constants not available or didn't match
+        if not matched then
+            if not (msg:find("You receive loot:") or msg:find("You create")) then
+                return
+            end
+            itemLink = msg:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+            if not itemLink then return end
+            quantity = tonumber(msg:match("x(%d+)") or "1")
+        else
+            -- Extract itemLink from the matched string if it's not already a link
+            if not itemLink:match("^|c%x+|Hitem:") then
+                itemLink = itemLink:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+            end
+            if not itemLink then return end
+            quantity = tonumber(quantity) or 1
+        end
         
         if itemLink then
-            local qty = msg:match("x(%d+)") or "1"
-            qty = tonumber(qty)
-            
-            -- Get item info (may need to wait for server response)
-            local itemName, _, _, _, _, _, _, _, _, itemTexture, vendorPrice = GetItemInfo(itemLink)
+            local itemName, _, quality, _, _, _, _, _, _, itemTexture, sellPrice = GetItemInfo(itemLink)
             
             if itemName then
-                local value, vendorVal, auctionVal = GetItemValue(itemLink)
-                value = value * qty
-                vendorVal = vendorVal * qty
-                auctionVal = auctionVal * qty
+                -- Filter out grey items if option is enabled (quality 0 = poor/grey)
+                if db.filterGreyItems and quality == 0 then
+                    return  -- Skip grey items
+                end
                 
-                local lootEntry = {
+                -- Cache item info
+                SetCachedItemInfo(itemLink, itemName, itemTexture, sellPrice)
+                
+                table.insert(db.lootLog, {
                     name = itemName,
                     link = itemLink,
-                    quantity = qty,
+                    quantity = quantity,
                     texture = itemTexture,
-                    value = value,
-                    vendorValue = vendorVal,
-                    auctionValue = auctionVal,
                     timestamp = time()
-                }
-                
-                table.insert(db.lootLog, lootEntry)
-                db.totalValue = db.totalValue + value
+                })
                 
                 if mainFrame:IsShown() then
                     self:UpdateDisplay()
                 end
             else
-                -- Item info not cached, use Classic-compatible delayed callback
+                -- Item not cached, retry after delay
                 DelayedCallback(0.5, function()
-                    local itemName, _, _, _, _, _, _, _, _, itemTexture, vendorPrice = GetItemInfo(itemLink)
+                    local itemName, _, quality, _, _, _, _, _, _, itemTexture, sellPrice = GetItemInfo(itemLink)
                     if itemName then
-                        local value, vendorVal, auctionVal = GetItemValue(itemLink)
-                        value = value * qty
-                        vendorVal = vendorVal * qty
-                        auctionVal = auctionVal * qty
+                        -- Filter out grey items if option is enabled
+                        if db.filterGreyItems and quality == 0 then
+                            return  -- Skip grey items
+                        end
                         
-                        local lootEntry = {
+                        -- Cache item info
+                        SetCachedItemInfo(itemLink, itemName, itemTexture, sellPrice)
+                        
+                        table.insert(db.lootLog, {
                             name = itemName,
                             link = itemLink,
-                            quantity = qty,
+                            quantity = quantity,
                             texture = itemTexture,
-                            value = value,
-                            vendorValue = vendorVal,
-                            auctionValue = auctionVal,
                             timestamp = time()
-                        }
-                        
-                        table.insert(db.lootLog, lootEntry)
-                        db.totalValue = db.totalValue + value
+                        })
                         
                         if mainFrame:IsShown() then
                             CLT:UpdateDisplay()
@@ -550,41 +1025,67 @@ CLT:SetScript("OnEvent", function(self, event, ...)
         end
         
     elseif event == "CHAT_MSG_MONEY" then
+        -- Skip tracking if interaction is paused
+        if interactionPaused then return end
+        
         local msg = ...
         
-        -- Parse money gained: "You loot 5 Gold, 23 Silver, 45 Copper"
-        local gold = msg:match("(%d+) Gold") or 0
-        local silver = msg:match("(%d+) Silver") or 0
-        local copper = msg:match("(%d+) Copper") or 0
+        -- Use game constants for better locale support (like KiwiFarm)
+        local GOLD_PTN = GOLD_AMOUNT and GOLD_AMOUNT:gsub("%%d", "(%d+)") or "(%d+) Gold"
+        local SILV_PTN = SILVER_AMOUNT and SILVER_AMOUNT:gsub("%%d", "(%d+)") or "(%d+) Silver"
+        local COPP_PTN = COPPER_AMOUNT and COPPER_AMOUNT:gsub("%%d", "(%d+)") or "(%d+) Copper"
         
-        gold = tonumber(gold) or 0
-        silver = tonumber(silver) or 0
-        copper = tonumber(copper) or 0
+        local gold = tonumber(msg:match(GOLD_PTN) or 0)
+        local silver = tonumber(msg:match(SILV_PTN) or 0)
+        local copper = tonumber(msg:match(COPP_PTN) or 0)
         
         local totalCopper = (gold * 10000) + (silver * 100) + copper
         
         if totalCopper > 0 then
-            local lootEntry = {
+            -- Track in separate money counter
+            db.moneyCash = (db.moneyCash or 0) + totalCopper
+            
+            -- Also add to loot log for display
+            table.insert(db.lootLog, {
                 name = "Gold",
                 link = nil,
                 quantity = 1,
                 texture = "Interface\\Icons\\INV_Misc_Coin_01",
                 value = totalCopper,
-                vendorValue = totalCopper,
-                auctionValue = 0,
-                timestamp = time()
-            }
-            
-            table.insert(db.lootLog, lootEntry)
-            db.totalValue = db.totalValue + totalCopper
+                timestamp = time(),
+                source = "loot"
+            })
             
             if mainFrame:IsShown() then
                 self:UpdateDisplay()
             end
         end
         
-    elseif event == "PLAYER_LOGOUT" then
-        -- Save handled automatically by SavedVariables
+    elseif event == "QUEST_TURNED_IN" then
+        -- Skip tracking if interaction is paused
+        if interactionPaused then return end
+        
+        local questID, experience, money = ...
+        
+        if money and money > 0 then
+            -- Track in separate quest money counter
+            db.moneyQuests = (db.moneyQuests or 0) + money
+            
+            -- Also add to loot log for display
+            table.insert(db.lootLog, {
+                name = "Quest Gold",
+                link = nil,
+                quantity = 1,
+                texture = "Interface\\Icons\\INV_Misc_Coin_01",
+                value = money,
+                timestamp = time(),
+                source = "quest"
+            })
+            
+            if mainFrame:IsShown() then
+                self:UpdateDisplay()
+            end
+        end
     end
 end)
 
@@ -610,11 +1111,48 @@ SlashCmdList["COOLLOOTTRACKER"] = function(msg)
             db.minimapButton.hide = false
             print("|cff00ff00Cool Loot Tracker:|r Minimap button shown.")
         end
+    elseif msg == "debug" then
+        print("|cff00ff00Cool Loot Tracker Debug:|r")
+        print("Auctionator available: " .. tostring(Auctionator ~= nil))
+        if Auctionator then
+            print("Auctionator API available: " .. tostring(Auctionator.API ~= nil))
+            if Auctionator.API and Auctionator.API.v1 then
+                print("Auctionator API v1 available: true")
+            end
+            print("Auctionator Database available: " .. tostring(Auctionator.Database ~= nil))
+            print("|cffffcc00Note:|r Auctionator needs AH scan data to show prices.")
+            print("Visit the AH and do a scan to populate price data.")
+        end
+        print("Total items logged: " .. #db.lootLog)
+        print("Total value: " .. FormatMoney(CalculateTotalValue()))
+        print("Session duration: " .. GetSessionDuration() .. " seconds")
+        print("Gold per hour (EMA): " .. FormatMoney(GetGoldPerHour()))
+        print("Interaction paused: " .. tostring(interactionPaused))
+        print("Price cache entries: " .. (function() local count = 0 for _ in pairs(PriceCache) do count = count + 1 end return count end)())
+        print("Item info cache entries: " .. (function() local count = 0 for _ in pairs(ItemInfoCache) do count = count + 1 end return count end)())
+        
+        -- Show price breakdown for first 5 items
+        print("Price breakdown (first 5 items):")
+        for i = 1, math.min(5, #db.lootLog) do
+            local loot = db.lootLog[i]
+            if loot.link then
+                local vendor, auction = GetPrices(loot.link)
+                local best = GetBestPrice(loot.link)
+                print(string.format("  %s x%d:", loot.name, loot.quantity))
+                print(string.format("    Vendor: %s, AH: %s, Using: %s", 
+                    vendor > 0 and FormatMoney(vendor) or "none",
+                    auction > 0 and FormatMoney(auction) or "none",
+                    best > 0 and FormatMoney(best) or "none"))
+            elseif loot.name == "Gold" then
+                print(string.format("  Gold: %s", FormatMoney(loot.value)))
+            end
+        end
     else
         print("|cff00ff00Cool Loot Tracker Commands:|r")
         print("/clt show - Show tracker window")
         print("/clt hide - Hide tracker window")
         print("/clt reset - Reset session")
         print("/clt minimap - Toggle minimap button")
+        print("/clt debug - Show debug info")
     end
-end
+endd
